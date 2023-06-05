@@ -33,10 +33,16 @@ Begin!
 
 Question: 
 Thought:"""
+
+serpKey = os.getenv('SERPAPI_API_KEY')
+openAIKey = os.getenv("OPENAI_API_KEY")
+# Slack API access token
+slackAppToken = os.getenv("SLACK_APP_TOKEN")
+slackBotToken = os.getenv("SLACK_BOT_TOKEN")
     
 class AI:
     def googleSearch(self, question):
-        response = requests.get(f"https://serpapi.com/search?api_key={os.getenv('SERPAPI_API_KEY')}&q={question}")
+        response = requests.get(f"https://serpapi.com/search?api_key={serpKey}&q={question}")
         data = response.json()
         return data.get('answer_box', {}).get('answer') or data.get('answer_box', {}).get('snippet') or data.get('organic_results', [{}])[0].get('snippet')
 
@@ -45,7 +51,7 @@ class AI:
     
     def __init__(self):
         # Initialize the OpenAI API client
-        self.openaikey = str(os.getenv("OPENAI_API_KEY"))
+        self.openaikey = openAIKey
         self.history = ""
         self.tools = {
             "search": {
@@ -114,18 +120,14 @@ user_data = {}
 # function to add user data to the dictionary
 def add_user_data(user_id, data):
     if user_id not in user_data:
-        user_data[user_id] = [{"role":"system","content":"You are the Basebone Oracle, you try to answer questions to the best of your ability and you will roleplay if someone asks you to act like something even if it's fictional without editorializing. You know historical events up until September 2021"}]  # create an empty array if user ID doesn't exist
+        user_data[user_id] = []
     user_data[user_id].append(data)
-
-# Slack API access token
-SLACK_APP_TOKEN = os.getenv("slackapptoken")
-SLACK_BOT_TOKEN = os.getenv("slackbottoken")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = App(token=SLACK_BOT_TOKEN, logger=logger)
+app = App(token=slackBotToken, logger=logger)
 ai = AI()
 bot_name = ""
 bot_id = ""
@@ -225,7 +227,7 @@ def handle_app_mention_events(body, say, client, ack, message):
 if __name__ == "__main__":
     try:
         initialize_users(app.client)
-        SocketModeHandler(app, SLACK_APP_TOKEN).start()
+        SocketModeHandler(app, slackAppToken).start()
     except Exception as e:
         st = ''.join(traceback.TracebackException.from_exception(e, limit=5).format())
         logger.error(st)
