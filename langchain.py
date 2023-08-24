@@ -9,6 +9,8 @@ import sys
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from sympy import sympify
+from dotenv import load_dotenv
+load_dotenv(".env")
 
 promptTemplate = """Answer the following questions as best you can. You have access to the following tools:
 
@@ -25,34 +27,43 @@ Thought: you should always think about what to do
 Action: the action to take, should be one of [search, calculator]
 Action Input: the input to the action
 Observation: the result of the action
-... (this Thought/Action/Action Input/Observation can repeat N times)
+... (this Thought/Action/Action Input/Observation can repeat 10 times)
 Thought: I now know the final answer
 Final Answer: the final answer to the original input question
 
 Begin!
 
-Question: 
+Question: {question}
 Thought:"""
 
-serpKey = os.getenv('SERPAPI_API_KEY')
-openAIKey = os.getenv("OPENAI_API_KEY")
+SERP_KEY = os.getenv('SERPAPI_API_KEY')
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # Slack API access token
-slackAppToken = os.getenv("SLACK_APP_TOKEN")
-slackBotToken = os.getenv("SLACK_BOT_TOKEN")
-    
+SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+
+
 class AI:
     def googleSearch(self, question):
-        response = requests.get(f"https://serpapi.com/search?api_key={serpKey}&q={question}")
+        response = requests.get(f"https://serpapi.com/search?api_key={SERP_KEY}&q={question}")
         data = response.json()
-        return data.get('answer_box', {}).get('answer') or data.get('answer_box', {}).get('snippet') or data.get('organic_results', [{}])[0].get('snippet')
+        return data.get('answer_box', {}).get('answer') or data.get('answer_box', {}).get('snippet') or \
+            data.get('organic_results', [{}])[0].get('snippet')
 
     def calculator(self, input):
         return str(sympify(input))
-    
-    def __init__(self):
-        # Initialize the OpenAI API client
-        self.openaikey = openAIKey
-        self.history = ""
+
+    def __init__(self, template):
+        self.template = template
+        self.headers = {
+            "Authorization": "Bearer " + OPENAI_API_KEY,
+            "Content-Type": "application/json"
+        }
+        self.url = "https://api.openai.com/v1/chat/completions"
+        self.system_msg = {
+            "role": "system",
+            "content": "You are a helpful assistant."
+        }
         self.tools = {
             "search": {
                 "description": "a search engine. useful for when you need to answer questions about current events. input should be a search query.",
@@ -64,171 +75,97 @@ class AI:
             },
         }
 
-    def completePrompt(self, prompt):
+    def parse_action_input(self, result):
+        action_match = re.search(r'Action: (.*?)\n', result)
+        action_input_match = re.search(r'Action Input: (.*?)\n', result)
+        if action_match and action_input_match:
+            action = action_match.group(1).strip()
+            action_input = action_input_match.group(1).strip()
+            return action, action_input
+        else:
+            return None, None
 
-        response = requests.post("https://api.openai.com/v1/completions", headers={
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + self.openaikey,
-        }, data=json.dumps({
-            "model": "text-davinci-003",
-            "prompt": prompt,
-            "max_tokens": 256,
-            "temperature": 0.7,
-            "stream": False,
-            "stop": ["Observation:"],
-        }))
-        logger.info(response)
-        data = response.json()
-        logger.info(data)
-        return data['choices'][0]['text']
+    def ask(self, question):
+        logging.info(f"Initial request: {question}")
+        text = self.template.format(question=question)
+        result = self.run_model(text)
 
-    def mergeHistory(self, question, history):
-        return promptTemplate.replace("", question).replace("", history)
-    
-    def answerQuestion(self, question):
-        prompt = promptTemplate.replace("", question).replace(
-            "",
-            "\n".join([f"{toolname}: {tool['description']}" for toolname, tool in self.tools.items()])
+        iteration = 1
+        while "Action:" in result:
+            logging.info(f"Iteration {iteration}: {result}")
+            action, action_input = self.parse_action_input(result)
+            if action and action in self.tools:
+                tool_result = self.tools[action]['execute'](action_input)
+                result = result + "\nObservation: " + tool_result
+            result = self.run_model(result)
+            iteration += 1
+
+        logging.info(f"Final result: {result}")
+
+        # Extract final answer
+        final_answer_match = re.search(r'Final Answer:(.*)', result, re.DOTALL)
+        if final_answer_match:
+            final_answer = final_answer_match.group(1).strip()
+            return final_answer
+        else:
+            return "No final answer found in the response."
+
+    def pretty_print_POST(self, req):
+        """
+        At this point it is completely built and ready
+        to be fired; it is "prepared".
+
+        However pay attention at the formatting used in
+        this function because it is programmed to be pretty
+        printed and may differ from the actual request.
+        """
+        return '{}\n{}\r\n{}\r\n\r\n{}'.format(
+            '-----------START-----------',
+            req.method + ' ' + req.url,
+            '\r\n'.join('{}: {}'.format(k, v) for k, v in req.headers.items()),
+            req.body,
         )
 
-        # Initialize a list to store all prompts
-        all_prompts = []
+    def run_model(self, text):
+        data = {
+            "model": "gpt-4",
+            "messages": [self.system_msg, {"role": "user", "content": text}]
+        }
+        logging.info(json.dumps(data))
+        req = requests.Request('POST', self.url, headers=self.headers, data=json.dumps(data))
+        prepared = req.prepare()
+        logging.info(self.pretty_print_POST(prepared))
+        s = requests.Session()
+        response = s.send(prepared)
 
-        while True:
-            response = self.completePrompt(prompt)
-            all_prompts.append(prompt + response)  # Store the current prompt
-            prompt += response
+        response.raise_for_status()
+        return response.json()['choices'][0]['message']['content']
 
-            action = next((line.split(": ")[1] for line in response.split("\n") if line.startswith("Action: ")), None)
-            if action and action != "None":
-                actionInput = next((line.split(": ")[1] for line in response.split("\n") if line.startswith("Action Input: ")), None)
-                result = self.tools[action.strip()]['execute'](actionInput)
-                prompt += f"Observation: {result}\n"
-            else:
-                final_answer = next((line.split(": ")[1] for line in response.split("\n") if line.startswith("Final Answer: ")), None)
-                # Return both the final answer and all prompts
-                return final_answer, all_prompts
 
-    def run(self, question):
-        question = self.mergeHistory(question, self.history)
-        answer, all_prompts = self.answerQuestion(question)
-        self.history += f"Q:{question}\nA:{answer}\n"
-        return answer, all_prompts
+# Initialize a new Slack app
+app = App(token=SLACK_BOT_TOKEN)
 
-user_data = {}
 
-# function to add user data to the dictionary
-def add_user_data(user_id, data):
-    if user_id not in user_data:
-        user_data[user_id] = []
-    user_data[user_id].append(data)
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-app = App(token=slackBotToken, logger=logger)
-ai = AI()
-bot_name = ""
-bot_id = ""
-
-# Global variable to store user id and name mapping
-users = {}
-
-def initialize_users(client):
-    response = client.users_list()
-    global users
-    for member in response['members']:
-        users[member['id']] = member['name']
-
-def refresh_users(client):
-    response = client.users_list()
-    global users
-    users.clear()  # clear the existing dictionary
-    for member in response['members']:
-        users[member['id']] = member['name']
-
-# To learn available listener arguments,
-# visit https://slack.dev/bolt-python/api-docs/slack_bolt/kwargs_injection/args.html
 @app.event("app_mention")
-def handle_app_mention_events(body, say, client, ack, message):
-    global promptTemplate
-    global bot_name
-    global bot_id
-    
-    if bot_name=="":
-        response = app.client.auth_test()
-        bot_id = response['user_id']
-        bot_name = users[bot_id]
-    
-    # Acknowledge the event
-    ack()
-    print("mention")
-    print(body["event"]["text"])
+def handle_app_mentions(body, say, logger):
+    user = body["event"]["user"]
+    text = body["event"]["text"].replace('<@U04NDHGEL3U>', '')
+    logger.info(f"Received message from {user} with text: {text}")
 
-    # Get the text of the message, user and channel info
-    prompt = body["event"]["text"]
-    user_id = body["event"]["user"]
-    channel_id = body["event"]["channel"]
+    try:
+        ai = AI(promptTemplate)
+        answer = ai.ask(text)
 
-    # Convert user id to username
-    username = users.get(user_id, None)
-    if username is None:
-        refresh_users(client)
-        username = users.get(user_id, user_id)  # fallback to user_id if username is still not found after refresh
+        if answer is None:
+            answer = "Sorry, I can't provide an answer at the moment."
 
-    prompt = prompt.replace(f'<@{user_id}>', f'@{username}')
+        say(answer)
+        logger.info(f"Sent response to {user}")
+    except Exception as e:
+        logger.error(f"Error: {e}", exc_info=True)
 
-    key = f"{user_id}-{channel_id}"
-    add_user_data(key, {"role":"user", "content":prompt})
-
-    # Handle special commands
-    if '+forget' in prompt:
-        if key in user_data:
-            user_data[key] = []
-        say("I've forgotten all history.")
-    elif '+prompt' in prompt:
-        additional_values = re.search(r'\+prompt(.*)$', prompt)
-        new_prompt = None
-        if additional_values:
-            new_prompt = additional_values.group(1)
-        if new_prompt and new_prompt.strip():
-            promptTemplate = new_prompt.strip()
-        say("Current prompt: " + promptTemplate)
-    elif prompt.strip()=="":
-        print("Empty prompt")
-        say("I can't use an empty prompt, it returns garbage.")
-    else:
-        answer, all_prompts = ai.run(prompt)
-        add_user_data(key, {"role":"assistant", "content":answer})
-
-        # Replace the bot's user id with its username in the answer and prompts
-        answer = answer.replace(f'<@{bot_id}>', f'@{bot_name}')
-        all_prompts = [prompt.replace(f'<@{bot_id}>', f'@{bot_name}') for prompt in all_prompts]
-
-        # Send the final answer
-        response = client.chat_postMessage(
-            channel=channel_id,
-            text=f'Final Answer: {answer}',
-        )
-        # Get the ts value (message ID) of the posted message
-        answer_ts = response["ts"]
-
-        # Prepare the response with intermediate prompts
-        response = '\n\nPrompting Chain:\n' + '\n'.join(all_prompts)
-
-        # Reply to the final answer with intermediate prompts
-        client.chat_postMessage(
-            channel=channel_id,
-            text=response,
-            thread_ts=answer_ts  # This makes it a reply to the final answer
-        )
 
 if __name__ == "__main__":
-    try:
-        initialize_users(app.client)
-        SocketModeHandler(app, slackAppToken).start()
-    except Exception as e:
-        st = ''.join(traceback.TracebackException.from_exception(e, limit=5).format())
-        logger.error(st)
-        sys.exit(1)
+    logging.basicConfig(level=logging.INFO)
+    handler = SocketModeHandler(app, SLACK_APP_TOKEN)
+    handler.start()
